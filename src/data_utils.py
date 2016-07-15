@@ -71,12 +71,14 @@ def read_vocabulary(path_to_vocab):
         raise ValueError('vocab file %s not exists! please run create_vocabulary() first.' % path_to_vocab)
     with open(path_to_vocab) as vf:
         vocab = {}
+        rev_vocab = {}
         for line in vf:
             line = line.decode('utf8').strip()
             chars_and_ids = re.split(ur'\s', line)
             assert len(chars_and_ids) == 2 or len(chars_and_ids) == 0
             vocab[chars_and_ids[1]] = int(chars_and_ids[0])
-        return vocab
+            rev_vocab[int(chars_and_ids[0])] = chars_and_ids[1]
+        return vocab, rev_vocab
 
 
 def sentence_to_token_ids(vocab, token):
@@ -95,7 +97,7 @@ def read_data(path_to_data_file, path_to_vocabulary, strip_chars='',  maximum_si
     """
     data = []
     count = 0
-    vocab = read_vocabulary(path_to_vocabulary)
+    vocab, _ = read_vocabulary(path_to_vocabulary)
 
     with open(path_to_data_file) as ipf:
         for line in ipf:
@@ -164,7 +166,9 @@ def data_iterator(raw_data, batch_size, num_steps, encoding_func=_generate_ibo2_
 if __name__ == '__main__':
     vocab_path = create_vocabulary('test', './')
     data = read_data('test', vocab_path)
-    for i, j in read_vocabulary(vocab_path).items():
+    for i, j in read_vocabulary(vocab_path)[0].items():
+        print i, j
+    for i, j in read_vocabulary(vocab_path)[1].items():
         print i, j
     for x, y in data_iterator(data, 2, 5):
         print x, y

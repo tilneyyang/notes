@@ -60,10 +60,12 @@ import os
 import time
 
 import numpy as np
+import sys
 import tensorflow as tf
 from tensorflow.python.platform import gfile
 
 import data_utils
+from data_utils import IBO2_LABEL
 
 flags = tf.flags
 logging = tf.logging
@@ -73,6 +75,8 @@ flags.DEFINE_string(
         "A type of model. Possible options are: large.")
 flags.DEFINE_string("data_dir", '/data/wordseg', "data_dir")
 flags.DEFINE_string("train_dir", '/data/wordseg/training', "train_dir")
+flags.DEFINE_integer("dump_per_steps", 200, "dump model after num of steps")
+flags.DEFINE_boolean("do_test", 0, "do test only")
 
 FLAGS = flags.FLAGS
 
@@ -86,6 +90,7 @@ class PTBModel(object):
         self.is_training = is_training
         size = config.hidden_size
         vocab_size = config.vocab_size
+        label_size = config.label_size
         self.global_step = tf.Variable(0, trainable=False)
 
         self._input_data = tf.placeholder(tf.int32, [batch_size, num_steps])
@@ -128,9 +133,9 @@ class PTBModel(object):
                 outputs.append(cell_output)
 
         output = tf.reshape(tf.concat(1, outputs), [-1, size])
-        softmax_w = tf.get_variable("softmax_w", [size, vocab_size])
-        softmax_b = tf.get_variable("softmax_b", [vocab_size])
-        logits = tf.matmul(output, softmax_w) + softmax_b
+        softmax_w = tf.get_variable("softmax_w", [size, label_size])
+        softmax_b = tf.get_variable("softmax_b", [label_size])
+        self.logits = logits = tf.matmul(output, softmax_w) + softmax_b
         loss = tf.nn.seq2seq.sequence_loss_by_example(
                 [logits],
                 [tf.reshape(self._targets, [-1])],
@@ -195,73 +200,155 @@ class LargeConfig(object):
     lr_decay = 1 / 1.15
     batch_size = 64
     vocab_size = 10000
+    label_size = len(IBO2_LABEL)
 
 
 class TestConfig(object):
-    """Tiny config, for testing."""
-    init_scale = 0.1
+    """for testing."""
+    init_scale = 0.04
     learning_rate = 1.0
-    max_grad_norm = 1
-    num_layers = 1
-    num_steps = 2
-    hidden_size = 2
-    max_epoch = 1
-    max_max_epoch = 1
-    keep_prob = 1.0
-    lr_decay = 0.5
-    batch_size = 20
+    max_grad_norm = 10
+    num_layers = 2
+    num_steps = 35
+    hidden_size = 1000
+    max_epoch = 14
+    max_max_epoch = 300
+    keep_prob = 0.35
+    lr_decay = 1 / 1.15
+    batch_size = 1
     vocab_size = 10000
+    label_size = len(IBO2_LABEL)
 
 
-def run_epoch(session, m, data, eval_op, verbose=False):
+def run_epoch(session, m, data, eval_op, verbose=False, rev_vocab=None):
     """Runs the model on the given data."""
-    epoch_size = len(data) // m.batch_size
     start_time = time.time()
     costs = 0.0
-    iters = 0
     state = m.initial_state.eval()
+    iters = 0
+    of = open('validate', 'w') if (not m.is_training and FLAGS.do_test) else None
     for step, (x, y) in enumerate(data_utils.data_iterator(data, m.batch_size,
                                                       m.num_steps)):
-        cost, state, _ = session.run([m.cost, m.final_state, eval_op],
+        cost, state, _, logits = session.run([m.cost, m.final_state, eval_op, m.logits],
                                      {m.input_data: x,
                                       m.targets: y,
                                       m.initial_state: state})
         costs += cost
         iters += m.num_steps
-        if verbose and step % 1 == 0:
-            print("current step: %s, %.3f perplexity: %.3f speed: %.0f wps" %
-                  (m.global_step.eval(), step * 1.0 / epoch_size, np.exp(costs / iters),
-                   iters * m.batch_size / (time.time() - start_time)))
+        if verbose and (step + 1) % FLAGS.dump_per_steps == 0:
+            print("current step: %s, perplexity: %.3f speed: %.0f wps" %
+                  (m.global_step.eval(), np.exp(costs / iters),
+                   FLAGS.dump_per_steps * m.batch_size / (time.time() - start_time)))
 
             if m.is_training:
-                print ('dumping model..')
+                print ('dumping model...')
                 m.saver.save(session, os.path.join(FLAGS.train_dir, "word_seg.ckpt"), global_step=m.global_step)
+                print ('dumping model finished.')
+
+        # testing
+        if not m.is_training and FLAGS.do_test:
+            assert of is not None
+            labels = np.argmax(logits, axis=1)
+            assert len(labels) == len(y[0])
+            for i in xrange(len(labels)):
+                if x[0][i] != data_utils.PAD_TOKEN_ID:
+                    of.write('%s\t%s\t%s\n' % (x[0][i] if rev_vocab is None else rev_vocab[x[0][i]].encode('utf8'), y[0][i], labels[i]))
+            of.write('\n')
+    if of is not None:
+        of.flush()
+        of.close()
 
     return np.exp(costs / iters)
 
 
 def get_config():
-    if FLAGS.model == "large":
+    if not FLAGS.do_test:
         return LargeConfig()
-    elif FLAGS.model == "test":
-        return TestConfig()
     else:
-        raise ValueError("Invalid model: %s", FLAGS.model)
+        return TestConfig()
 
+def do_evaluation(path_to_eval_file):
+    """
+    evaluate word segment quality, per token error.
+    :param path_to_eval_file:
+    :return:
+    """
+    tp = 0
+    fp = 0
+    expected_token_count = 0
+    actual_token_count = 0
+    expect_words = []
+    actual_words = []
+    expect_word_frag = ''
+    actual_word_frag = ''
+    sentence_count = 0
+    with open(path_to_eval_file) as evf:
+        for line in evf:
+            line = line.strip()
+            # at the end of sentence
+            if len(line) == 0:
+                sentence_count += 1
+                if len(expect_word_frag) > 0:
+                    expect_words.append(expect_word_frag)
+                    expect_word_frag = ''
+                if len(actual_word_frag) > 0:
+                    actual_words.append(actual_word_frag)
+                    actual_word_frag = ''
+                if len(expect_words) == 0:
+                    sys.stderr.write('found tow empty line in a raw.')
+                expected_token_count += len(expect_words)
+                actual_token_count += len(actual_words)
+                exs = ''
+                acs = ''
+                while len(expect_words) > 0:
+                    if len(exs) == len(acs):
+                        aw = actual_words.pop(0)
+                        ew = expect_words.pop(0)
+                        acs += aw
+                        exs += ew
+                        if aw == ew:
+                            tp += 1
+                        else:
+                            fp += 1
+                    while len(exs) != len(acs):
+                        if len(exs) > len(acs):
+                            aw = actual_words.pop(0)
+                            acs += aw
+                            fp += 1
+                        else:
+                            ew = expect_words.pop(0)
+                            exs += ew
+                assert len(expect_words) == len(actual_words) == 0
+            else:
+                char, expect_tag, actual_tag = line.split('\t')
+                if expect_tag == '0' or expect_tag == '2':
+                    if len(expect_word_frag) > 0:
+                        expect_words.append(expect_word_frag)
+                    expect_word_frag = char
+                else:
+                    expect_word_frag += char
+
+                if actual_tag == '0' or actual_tag == '2':
+                    if len(actual_word_frag) > 0:
+                        actual_words.append(actual_word_frag)
+                    actual_word_frag = char
+                else:
+                    actual_word_frag += char
+    return tp, fp, actual_token_count, expected_token_count
 
 def main(_):
-    if not FLAGS.data_dir:
-        raise ValueError("Must set --data_dir to data directory")
+    if not FLAGS.data_dir or not FLAGS.train_dir:
+        raise ValueError("Must set --data_dir and --train_dir to data and training directory")
 
     vocab_path = data_utils.create_vocabulary(os.path.join(FLAGS.data_dir, 'train'), FLAGS.data_dir)
     train_data = data_utils.read_data(os.path.join(FLAGS.data_dir, 'train'), vocab_path)
     valid_data = data_utils.read_data(os.path.join(FLAGS.data_dir, 'dev'), vocab_path)
     test_data = valid_data
 
+    _, rev_vocab = data_utils.read_vocabulary(vocab_path)
+
+
     config = get_config()
-    eval_config = get_config()
-    eval_config.batch_size = 1
-    eval_config.num_steps = 1
 
     with tf.Graph().as_default(), tf.Session() as session:
         initializer = tf.random_uniform_initializer(-config.init_scale,
@@ -270,7 +357,7 @@ def main(_):
             m = PTBModel(is_training=True, config=config)
         with tf.variable_scope("model", reuse=True, initializer=initializer):
             mvalid = PTBModel(is_training=False, config=config)
-            mtest = PTBModel(is_training=False, config=eval_config)
+            mtest = PTBModel(is_training=False, config=config)
 
         ckpt = tf.train.get_checkpoint_state(FLAGS.train_dir)
         if ckpt and gfile.Exists(ckpt.model_checkpoint_path):
@@ -280,19 +367,24 @@ def main(_):
             print("Created model with fresh parameters.")
             tf.initialize_all_variables().run()
 
-        for i in range(config.max_max_epoch):
-            lr_decay = config.lr_decay ** max(i - config.max_epoch, 0.0)
-            m.assign_lr(session, config.learning_rate * lr_decay)
+        if not FLAGS.do_test:
+            for i in range(config.max_max_epoch):
+                lr_decay = config.lr_decay ** max(i - config.max_epoch, 0.0)
+                m.assign_lr(session, config.learning_rate * lr_decay)
 
-            print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
-            train_perplexity = run_epoch(session, m, train_data, m.train_op,
-                                         verbose=True)
-            print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
-            valid_perplexity = run_epoch(session, mvalid, valid_data, tf.no_op())
-            print("Epoch: %d Valid Perplexity: %.3f" % (i + 1, valid_perplexity))
+                print("Epoch: %d Learning rate: %.3f" % (i + 1, session.run(m.lr)))
 
-        test_perplexity = run_epoch(session, mtest, test_data, tf.no_op())
-        print("Test Perplexity: %.3f" % test_perplexity)
+                train_perplexity = run_epoch(session, m, train_data, m.train_op,
+                                             verbose=True)
+                print("Epoch: %d Train Perplexity: %.3f" % (i + 1, train_perplexity))
+                valid_perplexity = run_epoch(session, mvalid, valid_data, tf.no_op())
+                print("Epoch: %d Valid Perplexity: %.3f" % (i + 1, valid_perplexity))
+        else:
+            print ("do testing on test data...")
+            test_perplexity = run_epoch(session, mtest, test_data, tf.no_op(), rev_vocab=rev_vocab)
+            print("Test Perplexity: %.3f" % test_perplexity)
+            tp, fp, actual_token_count, expected_token_count = do_evaluation('validate')
+            print('precision: ', (tp + 0.0)/actual_token_count, ', recall: ', (tp + 0.0)/expected_token_count)
 
 
 if __name__ == "__main__":
